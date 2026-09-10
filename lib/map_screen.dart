@@ -142,9 +142,21 @@ class _MapScreenState extends State<MapScreen> {
       if (!mounted) return;
       setState(() {
         _isLoadingTrails = false;
-        _trailError = 'Trail data unavailable — tap Retry';
+        // Show the real underlying reason (network error, HTTP status,
+        // timeout, etc.) right in the UI — not just a generic message —
+        // since on mobile Safari there's no easy way to see the browser
+        // console to find out what actually went wrong.
+        _trailError = 'Trail data unavailable: ${_shortenError(e)}';
       });
     }
+  }
+
+  /// Trims a raw exception's toString() down to something short enough to
+  /// fit in a banner, since the full message (especially aggregated
+  /// mirror errors) can be very long.
+  String _shortenError(Object e) {
+    final text = e.toString().replaceFirst('ApiException: ', '');
+    return text.length > 140 ? '${text.substring(0, 140)}…' : text;
   }
 
   Future<void> _refreshAll() async {
