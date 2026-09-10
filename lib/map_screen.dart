@@ -4,17 +4,15 @@ import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
+import 'app_theme.dart';
 import 'api_service.dart';
 
+/// Live map tab: hiker's current position, nearby hiking trails
+/// (highlighted and color-coded by significance), a compact weather
+/// readout, and the SOS emergency-info sheet. Fully self-contained — owns
+/// its own live location stream independent of the Home/Advice snapshot.
 class MapScreen extends StatefulWidget {
-  final bool isDarkMode;
-  final VoidCallback onToggleTheme;
-
-  const MapScreen({
-    super.key,
-    required this.isDarkMode,
-    required this.onToggleTheme,
-  });
+  const MapScreen({super.key});
 
   @override
   State<MapScreen> createState() => _MapScreenState();
@@ -26,20 +24,17 @@ class _MapScreenState extends State<MapScreen> {
 
   Position? _currentPosition;
   WeatherData? _weather;
-  SafetyAssessment? _safety;
   List<Trail> _trails = [];
+  double? _trailSearchRadiusKm;
   bool _trailsFetchedOnce = false;
 
   bool _isLoadingLocation = true;
-  bool _isLoadingWeather = false;
   bool _isLoadingTrails = false;
 
   String? _locationError;
-  String? _weatherError;
   String? _trailError;
 
   bool _hasCenteredMap = false;
-  bool _showSafetyDetails = false;
 
   @override
   void initState() {
@@ -78,9 +73,7 @@ class _MapScreenState extends State<MapScreen> {
       }
 
       final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-        ),
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
       );
 
       if (!mounted) return;
@@ -93,13 +86,8 @@ class _MapScreenState extends State<MapScreen> {
       _loadTrails(position.latitude, position.longitude);
       _centerMapIfNeeded();
 
-      // Keep listening so the marker (and weather) stay current as the
-      // hiker moves along the trail.
       _positionStream = Geolocator.getPositionStream(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          distanceFilter: 15, // meters — ignore tiny GPS jitter
-        ),
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 15),
       ).listen((position) {
         if (!mounted) return;
         setState(() => _currentPosition = position);
@@ -120,32 +108,18 @@ class _MapScreenState extends State<MapScreen> {
   void _centerMapIfNeeded() {
     if (!_hasCenteredMap && _currentPosition != null) {
       _hasCenteredMap = true;
-      _mapController.move(
-        LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
-        14,
-      );
+      _mapController.move(LatLng(_currentPosition!.latitude, _currentPosition!.longitude), 14);
     }
   }
 
   Future<void> _loadWeather(double lat, double lon) async {
-    setState(() {
-      _isLoadingWeather = true;
-      _weatherError = null;
-    });
     try {
       final weather = await ApiService.fetchWeather(lat, lon);
       if (!mounted) return;
-      setState(() {
-        _weather = weather;
-        _safety = SafetyAdvisor.assess(weather, DateTime.now());
-        _isLoadingWeather = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _isLoadingWeather = false;
-        _weatherError = 'Weather unavailable';
-      });
+      setState(() => _weather = weather);
+    } catch (_) {
+      // Weather is shown as a secondary pill here; Home/Advice already
+      // surface a full error state, so we just skip updating silently.
     }
   }
 
@@ -155,16 +129,15 @@ class _MapScreenState extends State<MapScreen> {
       _trailError = null;
     });
     try {
-      final trails = await ApiService.fetchNearbyTrails(lat, lon);
+      final result = await ApiService.fetchNearbyTrails(lat, lon);
       if (!mounted) return;
       setState(() {
-        _trails = trails;
+        _trails = result.trails;
+        _trailSearchRadiusKm = result.radiusUsedKm;
         _isLoadingTrails = false;
         _trailsFetchedOnce = true;
       });
     } catch (e) {
-      // Printed to the debug console so the exact cause (timeout, DNS,
-      // bad response, etc.) is visible while testing.
       debugPrint('Trail fetch failed: $e');
       if (!mounted) return;
       setState(() {
@@ -192,385 +165,305 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
+  Color _colorForTrail(Trail trail) {
+    if (!trail.isNamedRoute) return AppColors.blue.withOpacity(0.55);
+    switch (trail.network) {
+      case 'iwn':
+        return const Color(0xFF7A5CC7);
+      case 'nwn':
+        return AppColors.red;
+      case 'rwn':
+        return AppColors.amber;
+      case 'lwn':
+        return const Color(0xFFCC8A2E);
+      default:
+        return AppColors.forest;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Stack(
-        children: [
-          _buildMap(),
-          SafeArea(
-            child: Column(
-              children: [
-                _buildTopBar(),
-                if (_safety != null) _buildSafetyCard(),
-                if (_weather != null || _isLoadingWeather || _weatherError != null)
-                  _buildWeatherCard(),
-                if (_trails.any((t) => t.isNamedRoute)) _buildTrailChipList(),
-                if (_locationError != null) _buildErrorBanner(_locationError!),
-                if (_trailError != null) _buildErrorBanner(_trailError!),
-                if (_trailError == null &&
-                    _trailsFetchedOnce &&
-                    !_isLoadingTrails &&
-                    _trails.isEmpty)
-                  _buildInfoBanner(
-                      'No trails found within 5 km of here. Try refreshing once you\'re closer to a trailhead.'),
-              ],
-            ),
-          ),
-          if (_isLoadingLocation) _buildFullScreenLoader('Finding your location…'),
-        ],
-      ),
-      floatingActionButton: _buildFabColumn(),
+    return Stack(
+      children: [
+        _buildMapWrap(context),
+        if (_isLoadingLocation) _buildFullScreenLoader('Finding your location…'),
+      ],
     );
   }
 
-  /// Color-codes a trail by how significant its OSM "network" tag says it
-  /// is (international > national > regional > local), with named-but-
-  /// untagged routes in a solid accent color and raw fallback fragments in
-  /// a muted, thin gray so they read as "minor path" rather than "trail".
-  Color _colorForTrail(Trail trail) {
-    if (!trail.isNamedRoute) {
-      return Colors.blueGrey.withOpacity(0.55);
-    }
-    switch (trail.network) {
-      case 'iwn':
-        return Colors.purple.shade400;
-      case 'nwn':
-        return Colors.red.shade600;
-      case 'rwn':
-        return Colors.orange.shade700;
-      case 'lwn':
-        return Colors.amber.shade700;
-      default:
-        return Colors.deepOrange.shade400;
-    }
+  Widget _buildMapWrap(BuildContext context) {
+    final center = _currentPosition != null
+        ? LatLng(_currentPosition!.latitude, _currentPosition!.longitude)
+        : const LatLng(46.8, 8.2);
+
+    return Column(
+      children: [
+        SizedBox(
+          height: 340,
+          child: Stack(
+            children: [
+              FlutterMap(
+                mapController: _mapController,
+                options: MapOptions(initialCenter: center, initialZoom: 14, minZoom: 3, maxZoom: 18),
+                children: [
+                  TileLayer(
+                    urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                    userAgentPackageName: 'com.example.hikesafe',
+                    maxNativeZoom: 19,
+                  ),
+                  PolylineLayer(
+                    polylines: [
+                      for (final trail in _trails)
+                        Polyline(
+                          points: trail.points,
+                          strokeWidth: trail.isNamedRoute ? 5 : 3,
+                          color: _colorForTrail(trail),
+                          borderStrokeWidth: trail.isNamedRoute ? 1.5 : 0.5,
+                          borderColor: Colors.white,
+                        ),
+                    ],
+                  ),
+                  if (_currentPosition != null)
+                    MarkerLayer(
+                      markers: [
+                        Marker(
+                          point: LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
+                          width: 44,
+                          height: 44,
+                          child: const _PulsingLocationDot(),
+                        ),
+                      ],
+                    ),
+                ],
+              ),
+              Positioned(
+                left: 14,
+                right: 14,
+                top: 15,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          _pill(
+                            _isLoadingTrails ? '● SEARCHING' : '● LIVE CONDITIONS',
+                            AppColors.green,
+                            Colors.white.withOpacity(0.91),
+                          ),
+                          const SizedBox(height: 6),
+                          _pill('Nearby trails', AppColors.ink, Colors.white.withOpacity(0.88), big: true),
+                        ],
+                      ),
+                    ),
+                    GestureDetector(
+                      onTap: _showSosSheet,
+                      child: Container(
+                        width: 48,
+                        height: 48,
+                        decoration: BoxDecoration(color: AppColors.red, borderRadius: BorderRadius.circular(15)),
+                        child: const Center(
+                          child: Text('SOS', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w900)),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Positioned(
+                right: 14,
+                bottom: 14,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  decoration: BoxDecoration(color: AppColors.amberBg, borderRadius: BorderRadius.circular(10)),
+                  child: Text(
+                    _weather != null
+                        ? '${_weather!.description} · ${_weather!.temperatureC.toStringAsFixed(0)}°'
+                        : 'Loading…',
+                    style: const TextStyle(fontSize: 10, color: AppColors.amberText, fontWeight: FontWeight.w900),
+                  ),
+                ),
+              ),
+              Positioned(
+                left: 14,
+                bottom: 14,
+                child: Row(
+                  children: [
+                    _circleIconButton(Icons.my_location, () {
+                      if (_currentPosition != null) {
+                        _mapController.move(LatLng(_currentPosition!.latitude, _currentPosition!.longitude), 15);
+                      }
+                    }),
+                    const SizedBox(width: 8),
+                    _circleIconButton(Icons.refresh, _refreshAll),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: Container(
+            decoration: BoxDecoration(
+              color: Theme.of(context).scaffoldBackgroundColor,
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(27)),
+            ),
+            transform: Matrix4.translationValues(0, -18, 0),
+            padding: const EdgeInsets.fromLTRB(18, 18, 18, 12),
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: 38,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.outline,
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                    margin: const EdgeInsets.only(bottom: 14),
+                    alignment: Alignment.center,
+                  ),
+                  if (_trails.any((t) => t.isNamedRoute)) ...[
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('Nearby named trails',
+                            style: TextStyle(fontSize: 15, fontWeight: FontWeight.w900, color: Theme.of(context).colorScheme.onSurface)),
+                        Text('${_trails.where((t) => t.isNamedRoute).length} FOUND',
+                            style: AppText.sectionMeta(AppColors.green)),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    _buildTrailChipList(context),
+                    const SizedBox(height: 8),
+                  ],
+                  if (_locationError != null) _buildErrorBanner(context, _locationError!),
+                  if (_trailError != null) _buildErrorBanner(context, _trailError!),
+                  if (_trailError == null && _trailsFetchedOnce && !_isLoadingTrails && _trails.isEmpty)
+                    _buildInfoBanner(
+                      context,
+                      'No trails found even within ${_trailSearchRadiusKm?.toStringAsFixed(0) ?? '150'} km. '
+                      'You may be somewhere without mapped hiking trails nearby.',
+                    ),
+                  if (_trailError == null &&
+                      _trails.isNotEmpty &&
+                      _trailSearchRadiusKm != null &&
+                      _trailSearchRadiusKm! > 5)
+                    _buildInfoBanner(context,
+                        'Nearest trails are about ${_trailSearchRadiusKm!.toStringAsFixed(0)} km away — none found closer.'),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
   }
 
-  /// A horizontally scrollable row of chips for every named trail found
-  /// nearby. Tapping one zooms/pans the map to fit that trail's full
-  /// extent, so "highlighted well" also means "easy to actually find".
-  Widget _buildTrailChipList() {
+  Widget _pill(String text, Color textColor, Color bg, {bool big = false}) {
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: 8, vertical: big ? 5 : 6),
+      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(8)),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: big ? 18 : 9,
+          color: textColor,
+          fontWeight: FontWeight.w900,
+          letterSpacing: big ? 0 : 1,
+        ),
+      ),
+    );
+  }
+
+  Widget _circleIconButton(IconData icon, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 38,
+        height: 38,
+        decoration: BoxDecoration(color: Colors.white.withOpacity(0.92), shape: BoxShape.circle),
+        child: Icon(icon, size: 18, color: AppColors.forest),
+      ),
+    );
+  }
+
+  Widget _buildTrailChipList(BuildContext context) {
     final namedTrails = _trails.where((t) => t.isNamedRoute).toList();
     return SizedBox(
       height: 40,
       child: ListView.separated(
-        padding: const EdgeInsets.symmetric(horizontal: 12),
         scrollDirection: Axis.horizontal,
         itemCount: namedTrails.length,
         separatorBuilder: (_, __) => const SizedBox(width: 8),
         itemBuilder: (context, index) {
           final trail = namedTrails[index];
-          final color = _colorForTrail(trail);
-          return ActionChip(
-            avatar: CircleAvatar(backgroundColor: color, radius: 6),
-            label: Text(
-              trail.name ?? trail.networkLabel,
-              style: const TextStyle(fontSize: 13),
+          return GestureDetector(
+            onTap: () => _mapController.fitCamera(
+              CameraFit.bounds(bounds: LatLngBounds.fromPoints(trail.points), padding: const EdgeInsets.all(48)),
             ),
-            backgroundColor: Theme.of(context).colorScheme.surface,
-            onPressed: () {
-              _mapController.fitCamera(
-                CameraFit.bounds(
-                  bounds: LatLngBounds.fromPoints(trail.points),
-                  padding: const EdgeInsets.all(48),
-                ),
-              );
-            },
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surface,
+                border: Border.all(color: Theme.of(context).colorScheme.outline),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(color: _colorForTrail(trail), shape: BoxShape.circle),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(trail.name ?? trail.networkLabel,
+                      style: TextStyle(fontSize: 10, fontWeight: FontWeight.w800, color: Theme.of(context).colorScheme.onSurface)),
+                ],
+              ),
+            ),
           );
         },
       ),
     );
   }
 
-  Widget _buildMap() {
-    final center = _currentPosition != null
-        ? LatLng(_currentPosition!.latitude, _currentPosition!.longitude)
-        : const LatLng(46.8, 8.2); // fallback center until GPS resolves
-
-    return FlutterMap(
-      mapController: _mapController,
-      options: MapOptions(
-        initialCenter: center,
-        initialZoom: 14,
-        minZoom: 3,
-        maxZoom: 18,
-      ),
-      children: [
-        TileLayer(
-          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-          userAgentPackageName: 'com.example.hikesafe',
-          maxNativeZoom: 19,
-        ),
-        PolylineLayer(
-          polylines: [
-            for (final trail in _trails)
-              Polyline(
-                points: trail.points,
-                strokeWidth: trail.isNamedRoute ? 5 : 3,
-                color: _colorForTrail(trail),
-                borderStrokeWidth: trail.isNamedRoute ? 1.5 : 0.5,
-                borderColor: Colors.white,
-              ),
-          ],
-        ),
-        if (_currentPosition != null)
-          MarkerLayer(
-            markers: [
-              Marker(
-                point: LatLng(
-                    _currentPosition!.latitude, _currentPosition!.longitude),
-                width: 44,
-                height: 44,
-                child: const _PulsingLocationDot(),
-              ),
-            ],
-          ),
-      ],
-    );
-  }
-
-  Widget _buildTopBar() {
-    return Padding(
-      padding: const EdgeInsets.all(8.0),
+  Widget _buildErrorBanner(BuildContext context, String message) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(color: AppColors.red, borderRadius: BorderRadius.circular(12)),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          _RoundIconButton(
-            icon: Icons.refresh,
-            onTap: _refreshAll,
-            tooltip: 'Refresh weather & trails',
-          ),
-          Row(
-            children: [
-              if (_isLoadingTrails)
-                const Padding(
-                  padding: EdgeInsets.only(right: 8),
-                  child: SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                ),
-              _RoundIconButton(
-                icon: widget.isDarkMode ? Icons.light_mode : Icons.dark_mode,
-                onTap: widget.onToggleTheme,
-                tooltip: 'Toggle theme',
-              ),
-            ],
+          const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 18),
+          const SizedBox(width: 10),
+          Expanded(child: Text(message, style: const TextStyle(color: Colors.white, fontSize: 12))),
+          TextButton(
+            onPressed: _initLocationFlow,
+            style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(0, 0)),
+            child: const Text('Retry', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w800)),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildSafetyCard() {
-    final safety = _safety!;
-    final Color accentColor = switch (safety.level) {
-      SafetyLevel.safe => Colors.green.shade600,
-      SafetyLevel.caution => Colors.orange.shade700,
-      SafetyLevel.headBack => Colors.red.shade700,
-    };
-    final IconData icon = switch (safety.level) {
-      SafetyLevel.safe => Icons.check_circle,
-      SafetyLevel.caution => Icons.warning_amber_rounded,
-      SafetyLevel.headBack => Icons.directions_walk,
-    };
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-      child: GestureDetector(
-        onTap: () => setState(() => _showSafetyDetails = !_showSafetyDetails),
-        child: Container(
-          width: double.infinity,
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: accentColor.withOpacity(0.15),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: accentColor, width: 1.5),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Icon(icon, color: accentColor, size: 26),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      safety.headline,
-                      style: TextStyle(
-                        fontSize: 17,
-                        fontWeight: FontWeight.bold,
-                        color: accentColor,
-                      ),
-                    ),
-                  ),
-                  Icon(
-                    _showSafetyDetails
-                        ? Icons.expand_less
-                        : Icons.expand_more,
-                    color: accentColor,
-                  ),
-                ],
-              ),
-              if (_showSafetyDetails) ...[
-                const SizedBox(height: 8),
-                for (final reason in safety.reasons)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 2),
-                    child: Text(
-                      '•  $reason',
-                      style: const TextStyle(fontSize: 14),
-                    ),
-                  ),
-                const SizedBox(height: 6),
-                Text(
-                  'Estimate only — always use your own judgement and check local conditions.',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontStyle: FontStyle.italic,
-                    color: Theme.of(context).colorScheme.onSurface.withOpacity(0.6),
-                  ),
-                ),
-              ],
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildInfoBanner(String message) {
+  Widget _buildInfoBanner(BuildContext context, String message) {
     return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      margin: const EdgeInsets.only(bottom: 10),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surface,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: Theme.of(context).colorScheme.onSurface.withOpacity(0.2),
-        ),
-      ),
-      child: Row(
-        children: [
-          const Icon(Icons.info_outline, size: 20),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(message, style: const TextStyle(fontSize: 13)),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildWeatherCard() {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12),
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: Theme.of(context).colorScheme.surface,
-          borderRadius: BorderRadius.circular(16),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.25),
-              blurRadius: 10,
-              offset: const Offset(0, 4),
-            ),
-          ],
-        ),
-        child: _isLoadingWeather && _weather == null
-            ? const Row(
-                children: [
-                  SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                  SizedBox(width: 12),
-                  Text('Loading weather…', style: TextStyle(fontSize: 16)),
-                ],
-              )
-            : _weatherError != null && _weather == null
-                ? Row(
-                    children: [
-                      const Icon(Icons.cloud_off, color: Colors.redAccent),
-                      const SizedBox(width: 10),
-                      Text(_weatherError!, style: const TextStyle(fontSize: 16)),
-                    ],
-                  )
-                : Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            '${_weather!.temperatureC.toStringAsFixed(0)}°C / '
-                            '${_weather!.temperatureF.toStringAsFixed(0)}°F',
-                            style: const TextStyle(
-                              fontSize: 30,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            _weather!.description,
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: Theme.of(context)
-                                  .colorScheme
-                                  .onSurface
-                                  .withOpacity(0.7),
-                            ),
-                          ),
-                        ],
-                      ),
-                      Column(
-                        crossAxisAlignment: CrossAxisAlignment.end,
-                        children: [
-                          _WeatherStat(
-                            icon: Icons.air,
-                            label:
-                                '${_weather!.windSpeedKmh.toStringAsFixed(0)} km/h',
-                          ),
-                          const SizedBox(height: 6),
-                          _WeatherStat(
-                            icon: Icons.water_drop,
-                            label:
-                                '${_weather!.precipitationProbability.toStringAsFixed(0)}% rain',
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-      ),
-    );
-  }
-
-  Widget _buildErrorBanner(String message) {
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-      decoration: BoxDecoration(
-        color: Colors.red.shade700,
+        border: Border.all(color: Theme.of(context).colorScheme.outline),
         borderRadius: BorderRadius.circular(12),
       ),
       child: Row(
         children: [
-          const Icon(Icons.warning_amber_rounded, color: Colors.white),
+          Icon(Icons.info_outline, size: 18, color: Theme.of(context).colorScheme.onSurface.withOpacity(0.7)),
           const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              message,
-              style: const TextStyle(color: Colors.white, fontSize: 14),
-            ),
-          ),
-          TextButton(
-            onPressed: _initLocationFlow,
-            child: const Text('Retry', style: TextStyle(color: Colors.white)),
-          ),
+          Expanded(child: Text(message, style: const TextStyle(fontSize: 12))),
         ],
       ),
     );
@@ -585,96 +478,14 @@ class _MapScreenState extends State<MapScreen> {
           children: [
             const CircularProgressIndicator(color: Colors.white),
             const SizedBox(height: 16),
-            Text(
-              message,
-              style: const TextStyle(color: Colors.white, fontSize: 16),
-            ),
+            Text(message, style: const TextStyle(color: Colors.white, fontSize: 16)),
           ],
         ),
       ),
     );
   }
-
-  Widget _buildFabColumn() {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        FloatingActionButton(
-          heroTag: 'center',
-          onPressed: () {
-            if (_currentPosition != null) {
-              _mapController.move(
-                LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
-                15,
-              );
-            }
-          },
-          backgroundColor: Theme.of(context).colorScheme.surface,
-          child: const Icon(Icons.my_location),
-        ),
-        const SizedBox(height: 12),
-        FloatingActionButton.extended(
-          heroTag: 'sos',
-          onPressed: _showSosSheet,
-          backgroundColor: Colors.red.shade700,
-          icon: const Icon(Icons.sos, color: Colors.white),
-          label: const Text(
-            'SOS',
-            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-          ),
-        ),
-      ],
-    );
-  }
 }
 
-/// Small stat row used inside the weather card (wind / rain chance).
-class _WeatherStat extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  const _WeatherStat({required this.icon, required this.label});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Icon(icon, size: 18),
-        const SizedBox(width: 4),
-        Text(label,
-            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
-      ],
-    );
-  }
-}
-
-/// A round icon button used in the top bar.
-class _RoundIconButton extends StatelessWidget {
-  final IconData icon;
-  final VoidCallback onTap;
-  final String tooltip;
-
-  const _RoundIconButton({
-    required this.icon,
-    required this.onTap,
-    required this.tooltip,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: Theme.of(context).colorScheme.surface,
-      shape: const CircleBorder(),
-      elevation: 4,
-      child: IconButton(
-        icon: Icon(icon),
-        tooltip: tooltip,
-        onPressed: onTap,
-      ),
-    );
-  }
-}
-
-/// A simple animated dot marking the hiker's live GPS position.
 class _PulsingLocationDot extends StatefulWidget {
   const _PulsingLocationDot();
 
@@ -682,17 +493,13 @@ class _PulsingLocationDot extends StatefulWidget {
   State<_PulsingLocationDot> createState() => _PulsingLocationDotState();
 }
 
-class _PulsingLocationDotState extends State<_PulsingLocationDot>
-    with SingleTickerProviderStateMixin {
+class _PulsingLocationDotState extends State<_PulsingLocationDot> with SingleTickerProviderStateMixin {
   late final AnimationController _controller;
 
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 2),
-    )..repeat();
+    _controller = AnimationController(vsync: this, duration: const Duration(seconds: 2))..repeat();
   }
 
   @override
@@ -715,17 +522,14 @@ class _PulsingLocationDotState extends State<_PulsingLocationDot>
               child: Container(
                 width: 40,
                 height: 40,
-                decoration: BoxDecoration(
-                  color: Colors.blue.withOpacity(0.25),
-                  shape: BoxShape.circle,
-                ),
+                decoration: BoxDecoration(color: AppColors.forest.withOpacity(0.25), shape: BoxShape.circle),
               ),
             ),
             Container(
               width: 18,
               height: 18,
               decoration: BoxDecoration(
-                color: Colors.blueAccent,
+                color: AppColors.forest,
                 shape: BoxShape.circle,
                 border: Border.all(color: Colors.white, width: 3),
               ),
@@ -737,9 +541,6 @@ class _PulsingLocationDotState extends State<_PulsingLocationDot>
   }
 }
 
-/// Bottom sheet shown when the SOS button is tapped: large, copyable
-/// coordinates plus GPS elevation, for reading out loud or texting to
-/// rescuers/family and for route planning.
 class _SosSheet extends StatelessWidget {
   final Position? position;
   const _SosSheet({required this.position});
@@ -747,17 +548,11 @@ class _SosSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final pos = position;
-    final coordsText = pos == null
-        ? 'Location unavailable'
-        : '${pos.latitude.toStringAsFixed(6)}, ${pos.longitude.toStringAsFixed(6)}';
+    final coordsText =
+        pos == null ? 'Location unavailable' : '${pos.latitude.toStringAsFixed(6)}, ${pos.longitude.toStringAsFixed(6)}';
 
     return Container(
-      padding: EdgeInsets.only(
-        left: 20,
-        right: 20,
-        top: 20,
-        bottom: MediaQuery.of(context).viewInsets.bottom + 24,
-      ),
+      padding: EdgeInsets.only(left: 20, right: 20, top: 20, bottom: MediaQuery.of(context).viewInsets.bottom + 24),
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surface,
         borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
@@ -768,34 +563,33 @@ class _SosSheet extends StatelessWidget {
         children: [
           Row(
             children: [
-              const Icon(Icons.sos, color: Colors.red, size: 28),
-              const SizedBox(width: 8),
-              const Text(
-                'Emergency Info',
-                style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+              Container(
+                width: 32,
+                height: 32,
+                decoration: BoxDecoration(color: AppColors.red, borderRadius: BorderRadius.circular(16)),
+                child: const Icon(Icons.sos, color: Colors.white, size: 18),
               ),
+              const SizedBox(width: 10),
+              Text('Emergency Info',
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: Theme.of(context).colorScheme.onSurface)),
             ],
           ),
           const SizedBox(height: 16),
-          const Text('Your coordinates (share verbally or by text):',
-              style: TextStyle(fontSize: 14)),
+          Text('Your coordinates (share verbally or by text):',
+              style: TextStyle(fontSize: 14, color: Theme.of(context).colorScheme.onSurface.withOpacity(0.7))),
           const SizedBox(height: 6),
           SelectableText(
             coordsText,
-            style: const TextStyle(
-              fontSize: 26,
-              fontWeight: FontWeight.bold,
-              letterSpacing: 0.5,
-            ),
+            style: TextStyle(
+                fontSize: 26, fontWeight: FontWeight.w900, letterSpacing: 0.5, color: Theme.of(context).colorScheme.onSurface),
           ),
           const SizedBox(height: 20),
           if (pos != null) ...[
-            const Text('Elevation (from GPS):', style: TextStyle(fontSize: 14)),
+            Text('Elevation (from GPS):',
+                style: TextStyle(fontSize: 14, color: Theme.of(context).colorScheme.onSurface.withOpacity(0.7))),
             const SizedBox(height: 4),
-            Text(
-              '${pos.altitude.toStringAsFixed(0)} m',
-              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
-            ),
+            Text('${pos.altitude.toStringAsFixed(0)} m',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: Theme.of(context).colorScheme.onSurface)),
             const SizedBox(height: 20),
           ],
           ElevatedButton.icon(
@@ -803,25 +597,21 @@ class _SosSheet extends StatelessWidget {
                 ? null
                 : () {
                     Clipboard.setData(ClipboardData(text: coordsText));
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Coordinates copied')),
-                    );
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Coordinates copied')));
                   },
             icon: const Icon(Icons.copy),
             label: const Text('Copy coordinates'),
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red.shade700,
+              backgroundColor: AppColors.red,
               foregroundColor: Colors.white,
               padding: const EdgeInsets.symmetric(vertical: 14),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
             ),
           ),
           const SizedBox(height: 8),
           Text(
             'Tip: call local emergency services and read out the coordinates above.',
-            style: TextStyle(
-              fontSize: 12,
-              color: Theme.of(context).colorScheme.onSurface.withOpacity(0.6),
-            ),
+            style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurface.withOpacity(0.6)),
           ),
         ],
       ),
