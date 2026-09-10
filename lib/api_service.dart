@@ -282,12 +282,21 @@ class _OverpassResult {
 
 class ApiService {
   static const _weatherTimeout = Duration(seconds: 12);
-  static const _overpassTimeout = Duration(seconds: 15);
+  // Public Overpass mirrors are all hosted in Europe. A request from far
+  // away (e.g. North America) has to cross an ocean and back, plus
+  // transfer whatever data the query returns — 15s was tuned for
+  // same-continent latency and was too tight for long-distance
+  // connections, causing consistent timeouts even though the servers
+  // themselves were healthy.
+  static const _overpassTimeout = Duration(seconds: 25);
 
   static const _overpassEndpoints = [
-    'https://overpass-api.de/api/interpreter',
+    // lz4 = same backend as overpass-api.de but pre-compressed responses,
+    // which meaningfully cuts transfer time on slower/longer-haul links.
+    'https://lz4.overpass-api.de/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
     'https://overpass.private.coffee/api/interpreter',
+    'https://overpass.osm.ch/api/interpreter',
   ];
 
   // ---------------------------------------------------------------------
@@ -420,7 +429,7 @@ class ApiService {
         lat,
         lon,
         maxUnnamedFallbackTrails: maxUnnamedFallbackTrails,
-      ).timeout(const Duration(seconds: 35));
+      ).timeout(const Duration(seconds: 55));
     } on TimeoutException {
       throw ApiException(
           'Trail search took too long and was cancelled. This can happen far from any mapped trail — try again.');
