@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'package:http/http.dart' as http;
@@ -408,6 +409,29 @@ class ApiService {
     double lon, {
     int maxUnnamedFallbackTrails = 10,
   }) async {
+    // Hard ceiling on the whole search, no matter how many radius tiers
+    // or mirrors get tried. Without this, a run of slow/dead mirrors
+    // across several escalating radii could — in the worst case — take
+    // minutes, which just looks like the app hung. If this fires, the
+    // caller gets a clear "search timed out" error instead of an
+    // indefinite spinner.
+    try {
+      return await _fetchNearbyTrailsUnbounded(
+        lat,
+        lon,
+        maxUnnamedFallbackTrails: maxUnnamedFallbackTrails,
+      ).timeout(const Duration(seconds: 35));
+    } on TimeoutException {
+      throw ApiException(
+          'Trail search took too long and was cancelled. This can happen far from any mapped trail — try again.');
+    }
+  }
+
+  static Future<TrailSearchResult> _fetchNearbyTrailsUnbounded(
+    double lat,
+    double lon, {
+    required int maxUnnamedFallbackTrails,
+  }) async {
     const radiiMeters = [5000.0, 15000.0, 40000.0, 80000.0, 150000.0];
 
     for (final radiusMeters in radiiMeters) {
@@ -459,6 +483,19 @@ class ApiService {
       return namedResult;
     }
 
+    // Skip the raw path/track fallback at large radii: at country-scale
+    // distances an unnamed, disconnected path fragment isn't useful
+    // anyway, and the query can return a huge payload that risks timing
+    // out the Overpass server itself. Named routes alone are enough
+    // signal that far out.
+    if (radiusMeters > 40000) {
+      return _OverpassResult(
+        trails: [],
+        hadRealError: namedResult.hadRealError,
+        errors: namedResult.errors,
+      );
+    }
+
     final fallbackQuery = '''
       [out:json][timeout:12];
       (
@@ -506,46 +543,51 @@ class ApiService {
     );
   }
 
-  /// Runs an Overpass query across all mirrors, stopping at the first
-  /// mirror that responds successfully (even with zero results, since an
-  /// empty-but-successful response is meaningful and shouldn't trigger
-  /// pointless retries against every mirror).
+  /// Runs an Overpass query against all mirrors AT THE SAME TIME and
+  /// returns the first one to succeed, instead of trying them one after
+  /// another. Sequential retries meant a couple of slow/dead mirrors in a
+  /// row could stack up to a minute or more of waiting; racing them means
+  /// the total wait is roughly however long the *fastest* mirror takes.
   static Future<_OverpassResult> _runOverpassQuery(
     String query,
     List<Trail> Function(Map<String, dynamic> data) parser,
   ) async {
+    final completer = Completer<_OverpassResult>();
     final errors = <String>[];
+    int remaining = _overpassEndpoints.length;
 
     for (final endpoint in _overpassEndpoints) {
-      try {
-        final response = await http
-            .post(
-              Uri.parse(endpoint),
-              headers: {
-                // Public Overpass mirrors throttle or reject requests from
-                // generic/anonymous HTTP clients. An identifying
-                // User-Agent is expected practice and avoids 406/429s.
-                'User-Agent': 'HikeSafeApp/1.0 (Flutter hiking safety app)',
-              },
-              body: {'data': query},
-            )
-            .timeout(_overpassTimeout);
-
-        if (response.statusCode != 200) {
-          errors.add('$endpoint -> HTTP ${response.statusCode}');
-          continue;
+      _attemptOverpassEndpoint(endpoint, query, parser).then((trails) {
+        if (!completer.isCompleted) {
+          completer.complete(_OverpassResult(trails: trails, hadRealError: false, errors: const []));
         }
-
-        final data = jsonDecode(response.body) as Map<String, dynamic>;
-        final trails = parser(data);
-        return _OverpassResult(trails: trails, hadRealError: false, errors: errors);
-      } catch (e) {
+      }).catchError((Object e) {
         errors.add('$endpoint -> $e');
-        continue;
-      }
+        remaining--;
+        if (remaining == 0 && !completer.isCompleted) {
+          completer.complete(_OverpassResult(trails: [], hadRealError: true, errors: errors));
+        }
+      });
     }
 
-    return _OverpassResult(trails: [], hadRealError: true, errors: errors);
+    return completer.future;
+  }
+
+  static Future<List<Trail>> _attemptOverpassEndpoint(
+    String endpoint,
+    String query,
+    List<Trail> Function(Map<String, dynamic> data) parser,
+  ) async {
+    final response = await http
+        .post(Uri.parse(endpoint), body: {'data': query})
+        .timeout(_overpassTimeout);
+
+    if (response.statusCode != 200) {
+      throw ApiException('HTTP ${response.statusCode}');
+    }
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    return parser(data);
   }
 
   /// Parses the named-route-relations query response: relations (with tags
