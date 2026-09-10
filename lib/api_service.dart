@@ -544,11 +544,18 @@ class ApiService {
     final latDelta = radiusMeters / metersPerDegreeLat;
     final lonDelta = radiusMeters / (metersPerDegreeLon < 1 ? 1 : metersPerDegreeLon);
 
+    // Rounded to ~11m precision. Several Overpass front-ends cache
+    // identical GET queries at the proxy level — rounding means two
+    // people standing within the same city block generate the exact
+    // same query string and can share a cache hit instead of both
+    // paying the full query cost.
+    double round4(double v) => (v * 10000).round() / 10000;
+
     return _BoundingBox(
-      south: lat - latDelta,
-      north: lat + latDelta,
-      west: lon - lonDelta,
-      east: lon + lonDelta,
+      south: round4(lat - latDelta),
+      north: round4(lat + latDelta),
+      west: round4(lon - lonDelta),
+      east: round4(lon + lonDelta),
     );
   }
 
@@ -587,9 +594,13 @@ class ApiService {
     String query,
     List<Trail> Function(Map<String, dynamic> data) parser,
   ) async {
-    final response = await http
-        .post(Uri.parse(endpoint), body: {'data': query})
-        .timeout(_overpassTimeout);
+    // GET (with the query in the URL) is used instead of POST: several
+    // Overpass front-ends cache identical GET requests at the proxy
+    // level, so a repeated or shared search (e.g. two hikers near the
+    // same trailhead) can be served from cache instead of re-running the
+    // full query — meaningfully faster on a slow/distant connection.
+    final uri = Uri.parse(endpoint).replace(queryParameters: {'data': query});
+    final response = await http.get(uri).timeout(_overpassTimeout);
 
     if (response.statusCode != 200) {
       throw ApiException('HTTP ${response.statusCode}');
