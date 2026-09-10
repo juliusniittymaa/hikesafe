@@ -587,6 +587,18 @@ class ApiService {
     }
 
     final data = jsonDecode(response.body) as Map<String, dynamic>;
+
+    // Overpass sometimes returns HTTP 200 even when the query timed out
+    // or errored on ITS side — it just reports zero elements with a note
+    // in "remark" instead of a proper error status. Without checking for
+    // this, a server-side timeout over a huge search area looks exactly
+    // like "genuinely searched everywhere and found nothing", which is a
+    // false negative, not a real result.
+    final remark = data['remark'] as String?;
+    if (remark != null && remark.toLowerCase().contains('runtime error')) {
+      throw ApiException('Overpass runtime error: $remark');
+    }
+
     return parser(data);
   }
 
