@@ -594,13 +594,9 @@ class ApiService {
     String query,
     List<Trail> Function(Map<String, dynamic> data) parser,
   ) async {
-    // GET (with the query in the URL) is used instead of POST: several
-    // Overpass front-ends cache identical GET requests at the proxy
-    // level, so a repeated or shared search (e.g. two hikers near the
-    // same trailhead) can be served from cache instead of re-running the
-    // full query — meaningfully faster on a slow/distant connection.
-    final uri = Uri.parse(endpoint).replace(queryParameters: {'data': query});
-    final response = await http.get(uri).timeout(_overpassTimeout);
+    final response = await http
+        .post(Uri.parse(endpoint), body: {'data': query})
+        .timeout(_overpassTimeout);
 
     if (response.statusCode != 200) {
       throw ApiException('HTTP ${response.statusCode}');
