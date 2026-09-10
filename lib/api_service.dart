@@ -293,10 +293,15 @@ class ApiService {
   static const _overpassEndpoints = [
     // lz4 = same backend as overpass-api.de but pre-compressed responses,
     // which meaningfully cuts transfer time on slower/longer-haul links.
+    // NOTE: every endpoint here must have GLOBAL data coverage. A mirror
+    // with only regional coverage (e.g. Switzerland-only) can respond
+    // fast with a legitimate-looking empty result for anywhere outside
+    // its region, and since we take the first success in a race, that
+    // false empty result can beat out the real global mirrors — which is
+    // exactly what happened when overpass.osm.ch was included here.
     'https://lz4.overpass-api.de/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
     'https://overpass.private.coffee/api/interpreter',
-    'https://overpass.osm.ch/api/interpreter',
   ];
 
   // ---------------------------------------------------------------------
@@ -429,7 +434,7 @@ class ApiService {
         lat,
         lon,
         maxUnnamedFallbackTrails: maxUnnamedFallbackTrails,
-      ).timeout(const Duration(seconds: 55));
+      ).timeout(const Duration(seconds: 70));
     } on TimeoutException {
       throw ApiException(
           'Trail search took too long and was cancelled. This can happen far from any mapped trail — try again.');
@@ -559,11 +564,13 @@ class ApiService {
     );
   }
 
-  /// Runs an Overpass query against all mirrors AT THE SAME TIME and
-  /// returns the first one to succeed, instead of trying them one after
-  /// another. Sequential retries meant a couple of slow/dead mirrors in a
-  /// row could stack up to a minute or more of waiting; racing them means
-  /// the total wait is roughly however long the *fastest* mirror takes.
+  /// Runs an Overpass query against all mirrors AT THE SAME TIME.
+  /// A NON-EMPTY result completes immediately — real data from any one
+  /// healthy mirror is trustworthy. An EMPTY result, however, waits for
+  /// every other in-flight mirror to also respond before it's accepted,
+  /// since a mirror with incomplete or region-limited data can return a
+  /// fast, technically-successful-but-wrong "zero results" that would
+  /// otherwise win the race and mask a real find from a slower mirror.
   static Future<_OverpassResult> _runOverpassQuery(
     String query,
     List<Trail> Function(Map<String, dynamic> data) parser,
@@ -571,17 +578,34 @@ class ApiService {
     final completer = Completer<_OverpassResult>();
     final errors = <String>[];
     int remaining = _overpassEndpoints.length;
+    bool haveEmptySuccess = false;
 
     for (final endpoint in _overpassEndpoints) {
       _attemptOverpassEndpoint(endpoint, query, parser).then((trails) {
-        if (!completer.isCompleted) {
+        remaining--;
+        if (completer.isCompleted) return;
+
+        if (trails.isNotEmpty) {
           completer.complete(_OverpassResult(trails: trails, hadRealError: false, errors: const []));
+          return;
+        }
+
+        // Empty result: only settle on "genuinely empty" once nothing
+        // else is still in flight that might find something real.
+        haveEmptySuccess = true;
+        if (remaining == 0) {
+          completer.complete(_OverpassResult(trails: [], hadRealError: false, errors: const []));
         }
       }).catchError((Object e) {
         errors.add('$endpoint -> $e');
         remaining--;
-        if (remaining == 0 && !completer.isCompleted) {
-          completer.complete(_OverpassResult(trails: [], hadRealError: true, errors: errors));
+        if (completer.isCompleted) return;
+        if (remaining == 0) {
+          completer.complete(_OverpassResult(
+            trails: [],
+            hadRealError: !haveEmptySuccess,
+            errors: errors,
+          ));
         }
       });
     }
